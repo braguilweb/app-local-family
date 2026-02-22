@@ -1,5 +1,7 @@
+// src/lib/firebase.ts
 import { initializeApp } from "firebase/app";
 import { getDatabase } from "firebase/database";
+import { getAuth, signInAnonymously } from "firebase/auth";
 
 type FirebaseEnv = {
   VITE_FIREBASE_API_KEY: string;
@@ -46,3 +48,13 @@ const app = initializeApp({
 });
 
 export const db = getDatabase(app);
+export const auth = getAuth(app);
+
+/**
+ * Garante que existe um usuário autenticado (anônimo).
+ * Use isto antes de ler/escrever no RTDB quando suas rules dependem de auth.uid.
+ */
+export async function ensureSignedIn(): Promise<void> {
+  if (auth.currentUser) return;
+  await signInAnonymously(auth);
+}

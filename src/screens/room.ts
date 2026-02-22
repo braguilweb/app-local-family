@@ -1,3 +1,4 @@
+// src/screens/room.ts
 import {
   endAt,
   get,
@@ -12,12 +13,16 @@ import {
   remove,
   set,
   update,
+  onDisconnect,
+  serverTimestamp,
+  type Unsubscribe
 } from "firebase/database";
+
 import L, { type Map as LeafletMap, type Marker as LeafletMarker } from "leaflet";
 
 import { navigateToHome } from "../app/router";
 import type { Role } from "../app/router";
-import { db } from "../lib/firebase";
+import { db, auth } from "../lib/firebase";
 import { watchPosition, type StopWatching } from "../lib/geolocation";
 import { setupLeafletDefaultIcon } from "../lib/leaflet";
 
@@ -30,7 +35,7 @@ type LocationCurrent = {
 
 /**
  * Chat efêmero:
- * - guardamos mensagens em lista: rooms/{token}/chat/messages/{pushId}
+ * - mensagens em rooms/{token}/chat/messages/{pushId}
  * - UI mostra só as últimas 5
  * - cada msg tem expiresAt (TTL)
  * - limpeza é "best effort" no cliente (sem backend)
@@ -42,12 +47,59 @@ type ChatMessage = {
   expiresAt: number;
 };
 
+type RoomMeta = {
+  createdAt?: number;
+  expiresAt?: number;
+  parentUid?: string;
+  childUid?: string;
+};
+
+function escapeHtml(input: string): string {
+  return input
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+/** Helper: querySelector que nunca retorna null (evita TS "possibly null"). */
+function qs<T extends Element>(root: ParentNode, selector: string): T {
+  const el = root.querySelector(selector);
+  if (!el) throw new Error(`Elemento não encontrado: ${selector}`);
+  return el as T;
+}
+
 export function renderRoom(container: HTMLElement, token: string, role?: Role): void {
+  const uid = auth.currentUser?.uid;
+
   const childLink = `${window.location.origin}/#room=${encodeURIComponent(token)}&role=child`;
   const parentLink = `${window.location.origin}/#room=${encodeURIComponent(token)}&role=parent`;
 
-  const showMap = role === "parent";
-  const showParentStop = role === "parent";
+  const isParent = role === "parent";
+  const isChild = role === "child";
+
+  const showMap = isParent;
+  const showParentStop = isParent;
+
+  // UX: criança não precisa ver link do responsável (reduz risco de print/repasse)
+  const pairingHtml = isParent
+    ? `
+      <p style="margin: 0 0 8px;">
+        <strong>Link Criança:</strong>
+        <a href="${childLink}" target="_blank" rel="noreferrer">${childLink}</a>
+      </p>
+      <p style="margin: 0;">
+        <strong>Seu link (Responsável):</strong>
+        <a href="${parentLink}" target="_blank" rel="noreferrer">${parentLink}</a>
+      </p>
+    `
+    : `
+      <p style="margin: 0;">
+        <strong>Seu link (Criança):</strong>
+        <a href="${childLink}" target="_blank" rel="noreferrer">${childLink}</a>
+      </p>
+    `;
 
   container.innerHTML = `
     <main class="container">
@@ -62,24 +114,16 @@ export function renderRoom(container: HTMLElement, token: string, role?: Role): 
           <strong>Token:</strong>
           <code style="word-break: break-all;">${escapeHtml(token)}</code>
         </p>
-
-        <p style="margin: 0 0 8px;">
-          <strong>Link Criança:</strong>
-          <a href="${childLink}" target="_blank" rel="noreferrer">${childLink}</a>
-        </p>
-        <p style="margin: 0;">
-          <strong>Link Responsável:</strong>
-          <a href="${parentLink}" target="_blank" rel="noreferrer">${parentLink}</a>
-        </p>
+        ${pairingHtml}
+        <p id="room-status" style="margin: 8px 0 0; font-size: 12px;"></p>
       </section>
 
       <section class="card" style="margin-top:12px;">
         <h2>Localização</h2>
-        <p><strong>Role:</strong> <span id="role-label">${role ?? "(não definido)"}</span></p>
+        <p style="margin: 0 0 8px;"><strong>Role:</strong> <span id="role-label">${escapeHtml(role ?? "(não definido)")}</span></p>
 
         <div style="display:flex; gap:8px; flex-wrap:wrap;">
           <button id="btn-start" type="button">Iniciar compartilhamento (Criança)</button>
-          <button id="btn-stop" type="button" disabled>Parar (local)</button>
 
           ${
             showParentStop
@@ -112,151 +156,160 @@ export function renderRoom(container: HTMLElement, token: string, role?: Role): 
       ${
         showMap
           ? `
-      <section class="card" style="margin-top:12px;">
-        <h2>Mapa (Responsável)</h2>
-        <div id="map"></div>
-        <p id="map-status" style="margin: 8px 0 0; font-size: 12px;"></p>
-      </section>
-      `
+        <section class="card" style="margin-top:12px;">
+          <h2>Mapa (Responsável)</h2>
+          <div id="map"></div>
+          <p id="map-status" style="margin: 8px 0 0; font-size: 12px;"></p>
+        </section>
+        `
           : ""
       }
     </main>
   `;
 
-  /**
-   * Helper: querySelector que nunca retorna null.
-   * Isso evita os erros TS18047 ("possibly null") no build.
-   */
-  function qs<T extends Element>(selector: string): T {
-    const el = container.querySelector(selector);
-    if (!el) throw new Error(`Elemento não encontrado: ${selector}`);
-    return el as T;
+  const backBtn = qs<HTMLButtonElement>(container, "#btn-back");
+  const btnStart = qs<HTMLButtonElement>(container, "#btn-start");
+  const statusEl = qs<HTMLParagraphElement>(container, "#loc-status");
+  const roomStatusEl = qs<HTMLParagraphElement>(container, "#room-status");
+
+  // Para evitar vazamento de listeners/timers ao trocar de rota, guardamos cleanups
+  const unsubscribers: Unsubscribe[] = [];
+  let intervalId: number | null = null;
+  let stopWatching: StopWatching | null = null;
+  let disposed = false;
+
+  function dispose(): void {
+    if (disposed) return;
+    disposed = true;
+
+    if (stopWatching) stopWatching();
+    stopWatching = null;
+
+    for (const unsub of unsubscribers) unsub();
+    unsubscribers.length = 0;
+
+    if (intervalId != null) window.clearInterval(intervalId);
+    intervalId = null;
   }
 
-  // Elementos base
-  const backBtn = qs<HTMLButtonElement>("#btn-back");
-  const btnStart = qs<HTMLButtonElement>("#btn-start");
-  const btnStop = qs<HTMLButtonElement>("#btn-stop");
-  const statusEl = qs<HTMLParagraphElement>("#loc-status");
+  async function cleanupPresenceBestEffort(): Promise<void> {
+    // Best effort: se a aba fechar “do nada”, onDisconnect cuida do principal.
+    // Aqui limpamos quando o usuário usa o botão Voltar.
+    if (!uid || (!isParent && !isChild)) return;
 
-  backBtn.addEventListener("click", () => navigateToHome());
+    const presPath = isParent ? `rooms/${token}/presence/parent` : `rooms/${token}/presence/child`;
+    await remove(ref(db, presPath));
+  }
+
+  backBtn.addEventListener("click", () => {
+    void (async () => {
+      try {
+        dispose();
+        await cleanupPresenceBestEffort();
+      } finally {
+        navigateToHome();
+      }
+    })().catch(console.error);
+  });
+
+  // Se trocar hash (router vai re-renderizar), fazemos cleanup local também
+  window.addEventListener(
+    "hashchange",
+    () => {
+      // evita deixar watchPosition/interval rodando enquanto troca de tela
+      dispose();
+    },
+    { once: true }
+  );
+
+  // Verificação básica
+  if (!uid) {
+    roomStatusEl.textContent = "Erro: sem usuário autenticado (Anonymous). Recarregue a página.";
+    btnStart.disabled = true;
+    return;
+  }
 
   // ---------------------------
-  // Chat efêmero (últimas 5)
+  // Room meta (expiração / info)
   // ---------------------------
-  const TTL_MS = 60_000; // sugestão: 60s (ajuste se quiser)
-  const MAX_UI = 5;
+  void (async () => {
+    try {
+      const metaSnap = await get(ref(db, `rooms/${token}`));
+      const meta = (metaSnap.val() ?? {}) as RoomMeta;
 
-  const chatList = qs<HTMLUListElement>("#chat-list");
-  const chatForm = qs<HTMLFormElement>("#chat-form");
-  const chatInput = qs<HTMLInputElement>("#chat-input");
+      if (!metaSnap.exists()) {
+        roomStatusEl.textContent = "Sala não encontrada (talvez tenha sido encerrada).";
+        btnStart.disabled = true;
+        return;
+      }
 
-  const messagesRef = ref(db, `rooms/${token}/chat/messages`);
+      if (typeof meta.expiresAt === "number" && Date.now() > meta.expiresAt) {
+        roomStatusEl.textContent = "Sala expirada.";
+        btnStart.disabled = true;
+        return;
+      }
 
-  function addMsgToUi(listEl: HTMLUListElement, id: string, msg: ChatMessage): void {
-    const when = new Date(msg.ts).toLocaleTimeString();
-
-    const li = document.createElement("li");
-    li.dataset.id = id;
-    li.textContent = `[${when}] ${msg.from}: ${msg.text}`;
-    listEl.appendChild(li);
-
-    // mantém no máximo 5 no painel
-    while (listEl.children.length > MAX_UI) {
-      listEl.removeChild(listEl.firstElementChild!);
+      roomStatusEl.textContent = "Sala OK.";
+    } catch (e) {
+      console.error(e);
+      roomStatusEl.textContent = "Falha ao carregar metadados da sala (ver console).";
     }
+  })();
 
-    // remove da UI quando expirar (mesmo se o delete no RTDB atrasar)
-    const delay = msg.expiresAt - Date.now();
-    window.setTimeout(() => {
-      const el = listEl.querySelector<HTMLLIElement>(`li[data-id="${id}"]`);
-      if (el) el.remove();
-    }, Math.max(0, delay));
-  }
+  // ---------------------------
+  // Join automático da criança
+  // ---------------------------
+  async function joinAsChildIfNeeded(): Promise<void> {
+    if (!isChild) return;
 
-  // Evita duplicar visual se re-renderizar a tela
-  chatList.innerHTML = "";
+    // Se já tem childUid, não tenta entrar (evita “roubar” sala)
+    const childUidSnap = await get(ref(db, `rooms/${token}/childUid`));
+    const existing = childUidSnap.val() as string | null;
 
-  // Pegamos um pouco mais que 5 para não perder eventos, mas o painel limita em 5
-  const recent = query(messagesRef, limitToLast(20));
-
-  onChildAdded(recent, async (snap) => {
-    const id = snap.key;
-    if (!id) return;
-
-    const msg = snap.val() as ChatMessage;
-
-    // Se já expirou, tenta limpar do RTDB e não renderiza
-    if (msg.expiresAt <= Date.now()) {
-      await remove(snap.ref);
+    if (existing && existing !== uid) {
+      roomStatusEl.textContent = "Esta sala já tem uma criança pareada.";
+      btnStart.disabled = true;
       return;
     }
 
-    addMsgToUi(chatList, id, msg);
-  });
-
-  // Quando apagar do DB (limpeza), remove da UI
-  onChildRemoved(messagesRef, (snap) => {
-    const id = snap.key;
-    if (!id) return;
-    const el = chatList.querySelector<HTMLLIElement>(`li[data-id="${id}"]`);
-    if (el) el.remove();
-  });
-
-  chatForm.addEventListener("submit", async (ev) => {
-    ev.preventDefault();
-
-    if (role !== "parent" && role !== "child") return;
-
-    const text = chatInput.value.trim();
-    if (!text) return;
-
-    const now = Date.now();
-
-    await push(messagesRef, {
-      from: role,
-      text,
-      ts: now,
-      expiresAt: now + TTL_MS,
-    } satisfies ChatMessage);
-
-    chatInput.value = "";
-    chatInput.focus();
-  });
-
-  // Limpeza best-effort (sem backend): remove mensagens expiradas a cada 5s
-  async function cleanupExpired(): Promise<void> {
-    const now = Date.now();
-    const q = query(messagesRef, orderByChild("expiresAt"), endAt(now), limitToLast(50));
-    const snap = await get(q);
-    if (!snap.exists()) return;
-
-    const deletes: Promise<void>[] = [];
-    snap.forEach((child) => {
-      deletes.push(remove(child.ref));
+    // Faz update multi-path no root da sala (members/<uid> + childUid juntos)
+    await update(ref(db, `rooms/${token}`), {
+      [`members/${uid}`]: { role: "child" },
+      childUid: uid
     });
-    await Promise.all(deletes);
+
+    roomStatusEl.textContent = "Criança pareada nesta sala.";
   }
 
-  // não guardar em const (evita TS6133: unused local)
-  window.setInterval(() => {
-    cleanupExpired().catch(console.error);
-  }, 5000);
+  void joinAsChildIfNeeded().catch((e) => {
+    console.error(e);
+    roomStatusEl.textContent = "Falha ao parear como criança (ver console).";
+    btnStart.disabled = true;
+  });
 
   // ---------------------------
-  // Controle de UI do sharing
+  // Presença com onDisconnect()
   // ---------------------------
-  function setUiSharing(sharing: boolean): void {
-    btnStart.disabled = sharing;
-    btnStop.disabled = !sharing;
+  async function setPresenceOnline(): Promise<void> {
+    if (!isParent && !isChild) return;
+
+    const presPath = isParent ? `rooms/${token}/presence/parent` : `rooms/${token}/presence/child`;
+    const presRef = ref(db, presPath);
+
+    // Atualiza presença agora
+    await set(presRef, { online: true, lastSeenTs: Date.now() });
+
+    // onDisconnect vive no servidor e executa quando a conexão cair/fechar
+    onDisconnect(presRef).set({ online: false, lastSeenTs: serverTimestamp() });
   }
 
+  void setPresenceOnline().catch(console.error);
+
   // ---------------------------
-  // Botão "Parar" do responsável
+  // Controle do "stop" (pai manda)
   // ---------------------------
   if (showParentStop) {
-    const btnParentStop = qs<HTMLButtonElement>("#btn-parent-stop");
-
+    const btnParentStop = qs<HTMLButtonElement>(container, "#btn-parent-stop");
     btnParentStop.addEventListener("click", async () => {
       statusEl.textContent = "Enviando comando de parar para a criança...";
       await set(ref(db, `rooms/${token}/control/stopShareRequested`), true);
@@ -264,27 +317,55 @@ export function renderRoom(container: HTMLElement, token: string, role?: Role): 
     });
   }
 
+  // Criança obedece ao comando do pai (realtime)
+  if (isChild) {
+    const stopRef = ref(db, `rooms/${token}/control/stopShareRequested`);
+    const unsub = onValue(stopRef, async (snap) => {
+      const requested = snap.val() as boolean | null;
+      if (requested !== true) return;
+
+      if (stopWatching) {
+        stopWatching();
+        stopWatching = null;
+      }
+
+      await update(ref(db, `rooms/${token}/presence/child`), {
+        online: false,
+        lastSeenTs: Date.now()
+      });
+
+      // reseta para false (para não ficar travado)
+      await set(ref(db, `rooms/${token}/control/stopShareRequested`), false);
+
+      statusEl.textContent = "Compartilhamento interrompido pelo Responsável.";
+    });
+    unsubscribers.push(unsub);
+  }
+
   // ---------------------------
-  // Child: compartilhar localização
+  // Child: compartilhar localização (iniciar)
   // ---------------------------
-  let stopWatching: StopWatching | null = null;
   let lastWriteTs = 0;
 
+  function setUiSharing(sharing: boolean): void {
+    btnStart.disabled = sharing;
+  }
+
   btnStart.addEventListener("click", async () => {
-    if (role !== "child") {
-      statusEl.textContent = "Abra o link com role=child para compartilhar localização.";
+    if (!isChild) {
+      statusEl.textContent = "Somente a Criança pode iniciar o compartilhamento.";
       return;
     }
-
-    // Reseta o comando quando a criança começa (pra não herdar 'true' antigo)
-    await set(ref(db, `rooms/${token}/control/stopShareRequested`), false);
 
     statusEl.textContent = "Solicitando permissão de localização...";
     setUiSharing(true);
 
+    // A criança só para por comando do responsável (não tem botão local de parar)
+    await set(ref(db, `rooms/${token}/control/stopShareRequested`), false);
+
     await update(ref(db, `rooms/${token}/presence/child`), {
       online: true,
-      lastSeenTs: Date.now(),
+      lastSeenTs: Date.now()
     });
 
     try {
@@ -297,7 +378,7 @@ export function renderRoom(container: HTMLElement, token: string, role?: Role): 
           await set(ref(db, `rooms/${token}/location/current`), p);
           await update(ref(db, `rooms/${token}/presence/child`), {
             online: true,
-            lastSeenTs: Date.now(),
+            lastSeenTs: Date.now()
           });
 
           statusEl.textContent = `Enviando... lat=${p.lat.toFixed(5)} lng=${p.lng.toFixed(
@@ -317,45 +398,101 @@ export function renderRoom(container: HTMLElement, token: string, role?: Role): 
     }
   });
 
-  btnStop.addEventListener("click", async () => {
-    if (stopWatching) stopWatching();
-    stopWatching = null;
+  // ---------------------------
+  // Chat efêmero (últimas 5)
+  // ---------------------------
+  const TTL_MS = 60_000;
+  const MAX_UI = 5;
 
-    setUiSharing(false);
+  const chatList = qs<HTMLUListElement>(container, "#chat-list");
+  const chatForm = qs<HTMLFormElement>(container, "#chat-form");
+  const chatInput = qs<HTMLInputElement>(container, "#chat-input");
 
-    await update(ref(db, `rooms/${token}/presence/child`), {
-      online: false,
-      lastSeenTs: Date.now(),
-    });
+  const messagesRef = ref(db, `rooms/${token}/chat/messages`);
 
-    statusEl.textContent = "Compartilhamento parado (local).";
+  function addMsgToUi(listEl: HTMLUListElement, id: string, msg: ChatMessage): void {
+    const when = new Date(msg.ts).toLocaleTimeString();
+    const li = document.createElement("li");
+    li.dataset.id = id;
+    li.textContent = `[${when}] ${msg.from}: ${msg.text}`;
+    listEl.appendChild(li);
+
+    while (listEl.children.length > MAX_UI) {
+      listEl.removeChild(listEl.firstElementChild!);
+    }
+
+    const delay = msg.expiresAt - Date.now();
+    window.setTimeout(() => {
+      const el = listEl.querySelector<HTMLLIElement>(`li[data-id="${id}"]`);
+      if (el) el.remove();
+    }, Math.max(0, delay));
+  }
+
+  chatList.innerHTML = "";
+
+  const recent = query(messagesRef, limitToLast(20));
+  unsubscribers.push(
+    onChildAdded(recent, async (snap) => {
+      const id = snap.key;
+      if (!id) return;
+
+      const msg = snap.val() as ChatMessage;
+
+      if (msg.expiresAt <= Date.now()) {
+        await remove(snap.ref);
+        return;
+      }
+
+      addMsgToUi(chatList, id, msg);
+    })
+  );
+
+  unsubscribers.push(
+    onChildRemoved(messagesRef, (snap) => {
+      const id = snap.key;
+      if (!id) return;
+      const el = chatList.querySelector<HTMLLIElement>(`li[data-id="${id}"]`);
+      if (el) el.remove();
+    })
+  );
+
+  chatForm.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    if (!isParent && !isChild) return;
+
+    const text = chatInput.value.trim();
+    if (!text) return;
+
+    const now = Date.now();
+
+    await push(messagesRef, {
+      from: role,
+      text,
+      ts: now,
+      expiresAt: now + TTL_MS
+    } satisfies ChatMessage);
+
+    chatInput.value = "";
+    chatInput.focus();
   });
 
-  // Child obedece comando do responsável (realtime)
-  if (role === "child") {
-    const stopRef = ref(db, `rooms/${token}/control/stopShareRequested`);
+  async function cleanupExpired(): Promise<void> {
+    const now = Date.now();
+    const q = query(messagesRef, orderByChild("expiresAt"), endAt(now), limitToLast(50));
+    const snap = await get(q);
+    if (!snap.exists()) return;
 
-    onValue(stopRef, async (snap) => {
-      const requested = snap.val() as boolean | null;
-
-      if (requested !== true) return;
-      if (!stopWatching) return;
-
-      stopWatching();
-      stopWatching = null;
-      setUiSharing(false);
-
-      await update(ref(db, `rooms/${token}/presence/child`), {
-        online: false,
-        lastSeenTs: Date.now(),
-      });
-
-      // reset pra não ficar travado em true
-      await set(ref(db, `rooms/${token}/control/stopShareRequested`), false);
-
-      statusEl.textContent = "Parado por comando do Responsável.";
+    const deletes: Promise<void>[] = [];
+    snap.forEach((child) => {
+      deletes.push(remove(child.ref));
     });
+
+    await Promise.all(deletes);
   }
+
+  intervalId = window.setInterval(() => {
+    cleanupExpired().catch(console.error);
+  }, 5000);
 
   // ---------------------------
   // Parent: mapa Leaflet (última localização)
@@ -363,55 +500,46 @@ export function renderRoom(container: HTMLElement, token: string, role?: Role): 
   if (showMap) {
     setupLeafletDefaultIcon();
 
-    const mapEl = qs<HTMLDivElement>("#map");
-    const mapStatus = qs<HTMLParagraphElement>("#map-status");
+    const mapEl = qs<HTMLDivElement>(container, "#map");
+    const mapStatus = qs<HTMLParagraphElement>(container, "#map-status");
 
     let map: LeafletMap | null = null;
     let marker: LeafletMarker | null = null;
     let hasCentered = false;
 
-    // Init map (default Brasil)
     map = L.map(mapEl).setView([-14.235, -51.9253], 4);
 
     L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
       attribution: "&copy; OpenStreetMap contributors",
-      maxZoom: 19,
+      maxZoom: 19
     }).addTo(map);
 
     mapStatus.textContent = "Aguardando localização da criança...";
 
     const locRef = ref(db, `rooms/${token}/location/current`);
+    unsubscribers.push(
+      onValue(locRef, (snap) => {
+        const val = snap.val() as LocationCurrent | null;
 
-    onValue(locRef, (snap) => {
-      const val = snap.val() as LocationCurrent | null;
+        if (!val) {
+          mapStatus.textContent = "Sem localização ainda (a criança iniciou o compartilhamento?).";
+          return;
+        }
 
-      if (!val) {
-        mapStatus.textContent = "Sem localização ainda (a criança iniciou o compartilhamento?).";
-        return;
-      }
+        mapStatus.textContent = `Atualizado: ${new Date(val.ts).toLocaleTimeString()} (±${Math.round(
+          val.accuracy
+        )}m)`;
 
-      mapStatus.textContent = `Atualizado: ${new Date(val.ts).toLocaleTimeString()} (±${Math.round(
-        val.accuracy
-      )}m)`;
+        const latlng: [number, number] = [val.lat, val.lng];
 
-      const latlng: [number, number] = [val.lat, val.lng];
+        if (!marker) marker = L.marker(latlng).addTo(map!);
+        else marker.setLatLng(latlng);
 
-      if (!marker) marker = L.marker(latlng).addTo(map!);
-      else marker.setLatLng(latlng);
-
-      if (!hasCentered) {
-        map!.setView(latlng, 16);
-        hasCentered = true;
-      }
-    });
+        if (!hasCentered) {
+          map!.setView(latlng, 16);
+          hasCentered = true;
+        }
+      })
+    );
   }
-}
-
-function escapeHtml(input: string): string {
-  return input
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
 }

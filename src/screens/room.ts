@@ -33,13 +33,6 @@ type LocationCurrent = {
   ts: number;
 };
 
-/**
- * Chat efêmero:
- * - mensagens em rooms/{token}/chat/messages/{pushId}
- * - UI mostra só as últimas 5
- * - cada msg tem expiresAt (TTL)
- * - limpeza é "best effort" no cliente (sem backend)
- */
 type ChatMessage = {
   from: "parent" | "child";
   text: string;
@@ -54,6 +47,16 @@ type RoomMeta = {
   childUid?: string;
 };
 
+function formatLastSeen(timestamp: number): string {
+  const diff = Date.now() - timestamp;
+  const seconds = Math.floor(diff / 1000);
+  const minutes = Math.floor(diff / 60000);
+  
+  if (seconds < 60) return "agora";
+  if (minutes < 60) return "há " + minutes + " min";
+  return "há " + Math.floor(minutes / 60) + "h";
+}
+
 function escapeHtml(input: string): string {
   return input
     .replaceAll("&", "&amp;")
@@ -63,116 +66,137 @@ function escapeHtml(input: string): string {
     .replaceAll("'", "&#039;");
 }
 
-/** Helper: querySelector que nunca retorna null (evita TS "possibly null"). */
 function qs<T extends Element>(root: ParentNode, selector: string): T {
   const el = root.querySelector(selector);
-  if (!el) throw new Error(`Elemento não encontrado: ${selector}`);
+  if (!el) throw new Error("Elemento não encontrado: " + selector);
   return el as T;
 }
 
 export function renderRoom(container: HTMLElement, token: string, role?: Role): void {
   const uid = auth.currentUser?.uid;
 
-  const childLink = `${window.location.origin}/#room=${encodeURIComponent(token)}&role=child`;
-  const parentLink = `${window.location.origin}/#room=${encodeURIComponent(token)}&role=parent`;
+  const childLink = window.location.origin + "/#room=" + encodeURIComponent(token) + "&role=child";
+  
 
   const isParent = role === "parent";
   const isChild = role === "child";
 
-  const showMap = isParent;
-  const showParentStop = isParent;
+  
 
-  // UX: criança não precisa ver link do responsável (reduz risco de print/repasse)
-  const pairingHtml = isParent
-    ? `
-      <p style="margin: 0 0 8px;">
-        <strong>Link Criança:</strong>
-        <a href="${childLink}" target="_blank" rel="noreferrer">${childLink}</a>
-      </p>
-      <p style="margin: 0;">
-        <strong>Seu link (Responsável):</strong>
-        <a href="${parentLink}" target="_blank" rel="noreferrer">${parentLink}</a>
-      </p>
-    `
-    : `
-      <p style="margin: 0;">
-        <strong>Seu link (Criança):</strong>
-        <a href="${childLink}" target="_blank" rel="noreferrer">${childLink}</a>
-      </p>
-    `;
+  // Status bar baseado no papel
+  let statusHtml: string;
+  if (isParent) {
+    statusHtml = '<div class="status-bar" id="child-status"><div style="display: flex; align-items: center; gap: 8px;"><span class="status-dot offline" id="status-dot"></span><span class="status-text offline" id="status-text">Criança offline</span></div><span class="last-seen" id="last-seen">--</span></div>';
+  } else {
+    statusHtml = '<div class="status-bar"><div style="display: flex; align-items: center; gap: 8px;"><span class="status-dot online"></span><span class="status-text online">Você está online</span></div></div>';
+  }
 
-  container.innerHTML = `
-    <main class="container">
-      <header style="display:flex; gap:12px; align-items:center;">
-        <button id="btn-back" type="button">Voltar</button>
-        <h1 style="margin:0;">Sala</h1>
-      </header>
+  // HTML moderno e organizado - SEM TEMPLATE STRINGS ANINHADAS
+  let html = "";
+  
+  // Header
+  html += '<div class="app-header"><h1>App Família</h1><span class="badge badge-role">' + (isParent ? "Responsável" : isChild ? "Criança" : "Visitante") + "</span></div>";
+  
+  // Status
+  html += statusHtml;
+  
+  // Card Pareamento
+  html += '<div class="card"><div class="card-title">Pareamento</div>';
+  html += '<div style="font-size: 0.9rem; color: var(--text-light); margin-bottom: 12px;">Sala: <code style="background: var(--bg); padding: 4px 8px; border-radius: 4px; font-size: 0.8rem;">' + escapeHtml(token.slice(0, 16)) + "...</code></div>";
+  
+  if (isParent) {
+    html += '<div class="qr-section"><div class="qr-code" id="qrcode"></div><p style="font-size: 0.85rem; color: var(--text-light); margin-bottom: 12px;">Peça para a criança escanear este QR Code</p><button class="btn btn-secondary" id="btn-copy-link">Copiar link da criança</button></div>';
+  } else {
+    html += '<div style="text-align: center; padding: 16px; background: var(--bg); border-radius: 8px;"><p style="margin: 0; color: var(--text-light);">Você entrou como criança nesta sala</p></div>';
+  }
+  
+  html += '<p id="room-status" style="margin-top: 12px; font-size: 0.85rem; color: var(--text-light);"></p></div>';
+  
+  // Card Localização
+  html += '<div class="card"><div class="card-title">Localização</div>';
+  html += '<div id="loc-status" style="color: var(--text-light); font-size: 0.9rem; margin-bottom: 12px;">Aguardando início...</div>';
+  
+  if (isChild) {
+    html += '<button id="btn-start" class="btn btn-primary">Iniciar Compartilhamento</button>';
+  }
+  
+  if (isParent) {
+    html += '<button id="btn-parent-stop" class="btn btn-danger">Parar Compartilhamento</button>';
+  }
+  
+  html += "</div>";
+  
+  // Card Mapa (apenas parent)
+  if (isParent) {
+    html += '<div class="card"><div class="card-title">Mapa</div><div id="map" class="map-container"></div><div id="map-status" class="map-status">Aguardando localização...</div></div>';
+  }
+  
+  // Card Chat
+  let placeholderText: string;
+  if (isParent) {
+    placeholderText = "Mensagem para criança...";
+  } else {
+    placeholderText = "Mensagem para responsável...";
+  }
+  
+  html += '<div class="card"><div class="card-title">Chat</div><ul id="chat-list" class="chat-container"></ul>';
+  html += '<form id="chat-form" class="chat-form"><input type="text" id="chat-input" class="chat-input" placeholder="' + placeholderText + '" maxlength="200" autocomplete="off"><button type="submit" class="btn btn-primary" style="width: auto; padding: 12px 20px;">Enviar</button></form></div>';
+  
+  // Botão voltar
+  html += '<button id="btn-back" class="btn btn-secondary">Voltar para início</button>';
+  
+  container.innerHTML = html;
 
-      <section class="card" style="margin-top:12px;">
-        <h2>Pareamento</h2>
-        <p style="margin: 0 0 8px;">
-          <strong>Token:</strong>
-          <code style="word-break: break-all;">${escapeHtml(token)}</code>
-        </p>
-        ${pairingHtml}
-        <p id="room-status" style="margin: 8px 0 0; font-size: 12px;"></p>
-      </section>
-
-      <section class="card" style="margin-top:12px;">
-        <h2>Localização</h2>
-        <p style="margin: 0 0 8px;"><strong>Role:</strong> <span id="role-label">${escapeHtml(role ?? "(não definido)")}</span></p>
-
-        <div style="display:flex; gap:8px; flex-wrap:wrap;">
-          <button id="btn-start" type="button">Iniciar compartilhamento (Criança)</button>
-
-          ${
-            showParentStop
-              ? `<button id="btn-parent-stop" type="button">Parar compartilhamento (Responsável)</button>`
-              : ""
-          }
-        </div>
-
-        <p id="loc-status" style="margin: 8px 0 0; font-size: 12px;"></p>
-      </section>
-
-      <section class="card" style="margin-top:12px;">
-        <h2>Chat (efêmero)</h2>
-
-        <ul id="chat-list" style="margin:0 0 8px; padding-left:16px; font-size:12px;"></ul>
-
-        <form id="chat-form" style="display:flex; gap:8px;">
-          <input
-            id="chat-input"
-            type="text"
-            maxlength="280"
-            placeholder="Digite uma mensagem..."
-            style="flex:1;"
-            autocomplete="off"
-          />
-          <button type="submit">Enviar</button>
-        </form>
-      </section>
-
-      ${
-        showMap
-          ? `
-        <section class="card" style="margin-top:12px;">
-          <h2>Mapa (Responsável)</h2>
-          <div id="map"></div>
-          <p id="map-status" style="margin: 8px 0 0; font-size: 12px;"></p>
-        </section>
-        `
-          : ""
+  // Gerar QR Code se for parent
+  if (isParent) {
+    import("qrcode").then(QRCode => {
+      const qrContainer = container.querySelector("#qrcode");
+      if (qrContainer) {
+        // Cria um canvas dinamicamente
+        const canvas = document.createElement("canvas");
+        qrContainer.appendChild(canvas);
+        
+        QRCode.toCanvas(canvas, childLink, { width: 200 }, (err: any) => {
+          if (err) console.error("Erro ao gerar QR:", err);
+        });
       }
-    </main>
-  `;
+    }).catch(() => {
+      const qrContainer = container.querySelector("#qrcode");
+      if (qrContainer) {
+        qrContainer.innerHTML = '<div style="padding: 20px; background: white; border-radius: 8px;"><a href="' + childLink + '" style="font-size: 0.8rem; word-break: break-all;">' + childLink + "</a></div>";
+      }
+    });
+
+    // Botão copiar link
+    const btnCopy = container.querySelector("#btn-copy-link");
+    btnCopy?.addEventListener("click", () => {
+      navigator.clipboard.writeText(childLink).then(() => {
+        const btn = btnCopy as HTMLButtonElement;
+        const original = btn.textContent || "";
+        btn.textContent = "Copiado!";
+        setTimeout(() => btn.textContent = original, 2000);
+      });
+    });
+  }
 
   const backBtn = qs<HTMLButtonElement>(container, "#btn-back");
-  const btnStart = qs<HTMLButtonElement>(container, "#btn-start");
-  const statusEl = qs<HTMLParagraphElement>(container, "#loc-status");
+  //const btnStart = qs<HTMLButtonElement>(container, "#btn-start");
+  const statusEl = qs<HTMLDivElement>(container, "#loc-status");
   const roomStatusEl = qs<HTMLParagraphElement>(container, "#room-status");
 
-  // Para evitar vazamento de listeners/timers ao trocar de rota, guardamos cleanups
+  // CORREÇÃO: btnStart só existe para child, então buscamos condicionalmente
+let btnStart: HTMLButtonElement | null = null;
+if (isChild) {
+  btnStart = qs<HTMLButtonElement>(container, "#btn-start");
+}
+
+// CORREÇÃO: btnParentStop só existe para parent, então buscamos condicionalmente  
+let btnParentStop: HTMLButtonElement | null = null;
+if (isParent) {
+  btnParentStop = qs<HTMLButtonElement>(container, "#btn-parent-stop");
+}
+
+
   const unsubscribers: Unsubscribe[] = [];
   let intervalId: number | null = null;
   let stopWatching: StopWatching | null = null;
@@ -193,11 +217,9 @@ export function renderRoom(container: HTMLElement, token: string, role?: Role): 
   }
 
   async function cleanupPresenceBestEffort(): Promise<void> {
-    // Best effort: se a aba fechar “do nada”, onDisconnect cuida do principal.
-    // Aqui limpamos quando o usuário usa o botão Voltar.
     if (!uid || (!isParent && !isChild)) return;
 
-    const presPath = isParent ? `rooms/${token}/presence/parent` : `rooms/${token}/presence/child`;
+    const presPath = isParent ? "rooms/" + token + "/presence/parent" : "rooms/" + token + "/presence/child";
     await remove(ref(db, presPath));
   }
 
@@ -212,114 +234,123 @@ export function renderRoom(container: HTMLElement, token: string, role?: Role): 
     })().catch(console.error);
   });
 
-  // Se trocar hash (router vai re-renderizar), fazemos cleanup local também
   window.addEventListener(
     "hashchange",
     () => {
-      // evita deixar watchPosition/interval rodando enquanto troca de tela
       dispose();
     },
     { once: true }
   );
 
-  // Verificação básica
   if (!uid) {
-    roomStatusEl.textContent = "Erro: sem usuário autenticado (Anonymous). Recarregue a página.";
-    btnStart.disabled = true;
+    roomStatusEl.textContent = "Erro: sem usuário autenticado. Recarregue a página.";
+    if (btnStart) btnStart.disabled = true;
     return;
   }
 
-  // ---------------------------
-  // Room meta (expiração / info)
-  // ---------------------------
+  // Room meta
   void (async () => {
     try {
-      const metaSnap = await get(ref(db, `rooms/${token}`));
+      const metaSnap = await get(ref(db, "rooms/" + token));
       const meta = (metaSnap.val() ?? {}) as RoomMeta;
 
       if (!metaSnap.exists()) {
-        roomStatusEl.textContent = "Sala não encontrada (talvez tenha sido encerrada).";
-        btnStart.disabled = true;
+        roomStatusEl.textContent = "Sala não encontrada";
+        if (btnStart)btnStart.disabled = true;
         return;
       }
 
       if (typeof meta.expiresAt === "number" && Date.now() > meta.expiresAt) {
-        roomStatusEl.textContent = "Sala expirada.";
-        btnStart.disabled = true;
+        roomStatusEl.textContent = "Sala expirada";
+        if (btnStart) btnStart.disabled = true;
         return;
       }
 
-      roomStatusEl.textContent = "Sala OK.";
+      roomStatusEl.textContent = "Sala ativa";
     } catch (e) {
       console.error(e);
-      roomStatusEl.textContent = "Falha ao carregar metadados da sala (ver console).";
+      roomStatusEl.textContent = "Erro ao carregar sala";
     }
   })();
 
-  // ---------------------------
   // Join automático da criança
-  // ---------------------------
   async function joinAsChildIfNeeded(): Promise<void> {
     if (!isChild) return;
 
-    // Se já tem childUid, não tenta entrar (evita “roubar” sala)
-    const childUidSnap = await get(ref(db, `rooms/${token}/childUid`));
+    const childUidSnap = await get(ref(db, "rooms/" + token + "/childUid"));
     const existing = childUidSnap.val() as string | null;
 
     if (existing && existing !== uid) {
-      roomStatusEl.textContent = "Esta sala já tem uma criança pareada.";
-      btnStart.disabled = true;
+      roomStatusEl.textContent = "Sala já tem uma criança pareada";
+      if (btnStart) btnStart.disabled = true;
       return;
     }
 
-    // Faz update multi-path no root da sala (members/<uid> + childUid juntos)
-    await update(ref(db, `rooms/${token}`), {
-      [`members/${uid}`]: { role: "child" },
-      childUid: uid
-    });
+    await set(ref(db, "rooms/" + token + "/childUid"), uid);
+    await set(ref(db, "rooms/" + token + "/members/" + uid), { role: "child" });
 
-    roomStatusEl.textContent = "Criança pareada nesta sala.";
+    roomStatusEl.textContent = "Criança pareada com sucesso";
   }
 
   void joinAsChildIfNeeded().catch((e) => {
     console.error(e);
-    roomStatusEl.textContent = "Falha ao parear como criança (ver console).";
-    btnStart.disabled = true;
+    roomStatusEl.textContent = "Erro ao parear";
+    if (btnStart) btnStart.disabled = true;
   });
 
-  // ---------------------------
-  // Presença com onDisconnect()
-  // ---------------------------
+  // Presença
   async function setPresenceOnline(): Promise<void> {
     if (!isParent && !isChild) return;
 
-    const presPath = isParent ? `rooms/${token}/presence/parent` : `rooms/${token}/presence/child`;
+    const presPath = isParent ? "rooms/" + token + "/presence/parent" : "rooms/" + token + "/presence/child";
     const presRef = ref(db, presPath);
 
-    // Atualiza presença agora
     await set(presRef, { online: true, lastSeenTs: Date.now() });
-
-    // onDisconnect vive no servidor e executa quando a conexão cair/fechar
     onDisconnect(presRef).set({ online: false, lastSeenTs: serverTimestamp() });
   }
 
   void setPresenceOnline().catch(console.error);
 
-  // ---------------------------
-  // Controle do "stop" (pai manda)
-  // ---------------------------
-  if (showParentStop) {
-    const btnParentStop = qs<HTMLButtonElement>(container, "#btn-parent-stop");
-    btnParentStop.addEventListener("click", async () => {
-      statusEl.textContent = "Enviando comando de parar para a criança...";
-      await set(ref(db, `rooms/${token}/control/stopShareRequested`), true);
-      statusEl.textContent = "Comando enviado ✅";
+  // Status da criança em tempo real (apenas para parent)
+  if (isParent) {
+    const childPresenceRef = ref(db, "rooms/" + token + "/presence/child");
+    
+    const unsubPresence = onValue(childPresenceRef, (snap) => {
+      const presence = snap.val() as { online?: boolean; lastSeenTs?: number } | null;
+      const dot = container.querySelector("#status-dot") as HTMLElement;
+      const text = container.querySelector("#status-text") as HTMLElement;
+      const lastSeen = container.querySelector("#last-seen") as HTMLElement;
+      
+      if (!dot || !text || !lastSeen) return;
+      
+      if (presence?.online) {
+        dot.className = "status-dot online";
+        text.className = "status-text online";
+        text.textContent = "Criança online";
+        lastSeen.textContent = "agora";
+      } else {
+        dot.className = "status-dot offline";
+        text.className = "status-text offline";
+        text.textContent = "Criança offline";
+        const ts = presence?.lastSeenTs || Date.now();
+        lastSeen.textContent = formatLastSeen(ts);
+      }
     });
+    
+    unsubscribers.push(unsubPresence);
   }
 
-  // Criança obedece ao comando do pai (realtime)
+  // Controle do stop
+  if (isParent && btnParentStop) {
+  btnParentStop.addEventListener("click", async () => {
+    statusEl.textContent = "Enviando comando...";
+    await set(ref(db, "rooms/" + token + "/control/stopShareRequested"), true);
+    statusEl.textContent = "Comando enviado";
+  });
+}
+
   if (isChild) {
-    const stopRef = ref(db, `rooms/${token}/control/stopShareRequested`);
+    const stopRef = ref(db, "rooms/" + token + "/control/stopShareRequested");
     const unsub = onValue(stopRef, async (snap) => {
       const requested = snap.val() as boolean | null;
       if (requested !== true) return;
@@ -329,103 +360,136 @@ export function renderRoom(container: HTMLElement, token: string, role?: Role): 
         stopWatching = null;
       }
 
-      await update(ref(db, `rooms/${token}/presence/child`), {
+      await update(ref(db, "rooms/" + token + "/presence/child"), {
         online: false,
         lastSeenTs: Date.now()
       });
 
-      // reseta para false (para não ficar travado)
-      await set(ref(db, `rooms/${token}/control/stopShareRequested`), false);
+      await set(ref(db, "rooms/" + token + "/control/stopShareRequested"), false);
 
-      statusEl.textContent = "Compartilhamento interrompido pelo Responsável.";
+      statusEl.textContent = "Compartilhamento interrompido pelo Responsável";
+      if (btnStart) btnStart.disabled = false;
     });
     unsubscribers.push(unsub);
   }
 
-  // ---------------------------
-  // Child: compartilhar localização (iniciar)
-  // ---------------------------
-  let lastWriteTs = 0;
+  // Compartilhamento de localização
 
-  function setUiSharing(sharing: boolean): void {
-    btnStart.disabled = sharing;
+  if (isChild && btnStart) {
+  
+    let lastWriteTs = 0;
+    
+
+    btnStart.addEventListener("click", async () => {
+      if (!isChild) {
+        statusEl.textContent = "Somente a criança pode iniciar";
+        return;
+      }
+
+      statusEl.textContent = "Solicitando permissão de GPS...";
+      btnStart.disabled = true;
+
+      await set(ref(db, "rooms/" + token + "/control/stopShareRequested"), false);
+
+      await update(ref(db, "rooms/" + token + "/presence/child"), {
+        online: true,
+        lastSeenTs: Date.now()
+      });
+
+      try {
+        stopWatching = watchPosition(
+          async (p) => {
+            const now = Date.now();
+            if (now - lastWriteTs < 4000) return;
+            lastWriteTs = now;
+
+            await set(ref(db, "rooms/" + token + "/location/current"), p);
+            await update(ref(db, "rooms/" + token + "/presence/child"), {
+              online: true,
+              lastSeenTs: Date.now()
+            });
+
+            // SEM TEMPLATE STRING - USANDO CONCATENAÇÃO
+            const latStr = p.lat.toFixed(5);
+            const lngStr = p.lng.toFixed(5);
+            const accStr = Math.round(p.accuracy).toString();
+            statusEl.textContent = "Enviando... (" + latStr + ", " + lngStr + ") ±" + accStr + "m";
+          },
+          (err) => {
+            console.error(err);
+            statusEl.textContent = "Erro de GPS: " + err.message;
+            btnStart.disabled = false;
+          }
+        );
+      } catch (e) {
+        console.error(e);
+        statusEl.textContent = "Falha ao iniciar: " + (e as Error).message;
+        btnStart.disabled = false;
+      }
+    });
   }
 
-  btnStart.addEventListener("click", async () => {
-    if (!isChild) {
-      statusEl.textContent = "Somente a Criança pode iniciar o compartilhamento.";
-      return;
-    }
-
-    statusEl.textContent = "Solicitando permissão de localização...";
-    setUiSharing(true);
-
-    // A criança só para por comando do responsável (não tem botão local de parar)
-    await set(ref(db, `rooms/${token}/control/stopShareRequested`), false);
-
-    await update(ref(db, `rooms/${token}/presence/child`), {
-      online: true,
-      lastSeenTs: Date.now()
-    });
-
-    try {
-      stopWatching = watchPosition(
-        async (p) => {
-          const now = Date.now();
-          if (now - lastWriteTs < 4000) return; // throttle ~4s
-          lastWriteTs = now;
-
-          await set(ref(db, `rooms/${token}/location/current`), p);
-          await update(ref(db, `rooms/${token}/presence/child`), {
-            online: true,
-            lastSeenTs: Date.now()
-          });
-
-          statusEl.textContent = `Enviando... lat=${p.lat.toFixed(5)} lng=${p.lng.toFixed(
-            5
-          )} acc=${Math.round(p.accuracy)}m`;
-        },
-        (err) => {
-          console.error(err);
-          statusEl.textContent = `Erro de geolocalização: ${err.message}`;
-          setUiSharing(false);
-        }
-      );
-    } catch (e) {
-      console.error(e);
-      statusEl.textContent = `Falha ao iniciar: ${(e as Error).message}`;
-      setUiSharing(false);
-    }
-  });
-
-  // ---------------------------
-  // Chat efêmero (últimas 5)
-  // ---------------------------
-  const TTL_MS = 60_000;
+  // Chat
+  const TTL_MS = 60000;
   const MAX_UI = 5;
 
   const chatList = qs<HTMLUListElement>(container, "#chat-list");
   const chatForm = qs<HTMLFormElement>(container, "#chat-form");
   const chatInput = qs<HTMLInputElement>(container, "#chat-input");
 
-  const messagesRef = ref(db, `rooms/${token}/chat/messages`);
+  const messagesRef = ref(db, "rooms/" + token + "/chat/messages");
 
   function addMsgToUi(listEl: HTMLUListElement, id: string, msg: ChatMessage): void {
     const when = new Date(msg.ts).toLocaleTimeString();
     const li = document.createElement("li");
+    
+    // Define classe CSS baseada no remetente
+    if (msg.from === "parent") {
+      li.className = "chat-message parent";
+    } else {
+      li.className = "chat-message child";
+    }
+    
     li.dataset.id = id;
-    li.textContent = `[${when}] ${msg.from}: ${msg.text}`;
+    
+    // Cria estrutura segura
+    const metaDiv = document.createElement("div");
+    metaDiv.className = "chat-meta";
+    
+    let fromText: string;
+    if (msg.from === "parent") {
+      fromText = "Responsável";
+    } else {
+      fromText = "Criança";
+    }
+    metaDiv.textContent = fromText + " • " + when;
+    
+    const textDiv = document.createElement("div");
+    textDiv.textContent = msg.text;
+    
+    li.appendChild(metaDiv);
+    li.appendChild(textDiv);
     listEl.appendChild(li);
 
+    // Mantém apenas últimas 5 mensagens visíveis
     while (listEl.children.length > MAX_UI) {
-      listEl.removeChild(listEl.firstElementChild!);
+      if (listEl.firstElementChild) {
+        listEl.removeChild(listEl.firstElementChild);
+      }
     }
 
+    // Auto-scroll para última mensagem
+    listEl.scrollTop = listEl.scrollHeight;
+
+    // Remove após expirar
     const delay = msg.expiresAt - Date.now();
-    window.setTimeout(() => {
-      const el = listEl.querySelector<HTMLLIElement>(`li[data-id="${id}"]`);
-      if (el) el.remove();
-    }, Math.max(0, delay));
+    if (delay > 0) {
+      window.setTimeout(() => {
+        const selector = 'li[data-id="' + id + '"]';
+        const el = listEl.querySelector<HTMLLIElement>(selector);
+        if (el) el.remove();
+      }, delay);
+    }
   }
 
   chatList.innerHTML = "";
@@ -451,7 +515,7 @@ export function renderRoom(container: HTMLElement, token: string, role?: Role): 
     onChildRemoved(messagesRef, (snap) => {
       const id = snap.key;
       if (!id) return;
-      const el = chatList.querySelector<HTMLLIElement>(`li[data-id="${id}"]`);
+      const el = chatList.querySelector<HTMLLIElement>('li[data-id="' + id + '"]');
       if (el) el.remove();
     })
   );
@@ -467,7 +531,7 @@ export function renderRoom(container: HTMLElement, token: string, role?: Role): 
 
     await push(messagesRef, {
       from: role,
-      text,
+      text: text,
       ts: now,
       expiresAt: now + TTL_MS
     } satisfies ChatMessage);
@@ -494,14 +558,12 @@ export function renderRoom(container: HTMLElement, token: string, role?: Role): 
     cleanupExpired().catch(console.error);
   }, 5000);
 
-  // ---------------------------
-  // Parent: mapa Leaflet (última localização)
-  // ---------------------------
-  if (showMap) {
+  // Mapa
+  if (isParent) {
     setupLeafletDefaultIcon();
 
     const mapEl = qs<HTMLDivElement>(container, "#map");
-    const mapStatus = qs<HTMLParagraphElement>(container, "#map-status");
+    const mapStatus = qs<HTMLDivElement>(container, "#map-status");
 
     let map: LeafletMap | null = null;
     let marker: LeafletMarker | null = null;
@@ -510,25 +572,24 @@ export function renderRoom(container: HTMLElement, token: string, role?: Role): 
     map = L.map(mapEl).setView([-14.235, -51.9253], 4);
 
     L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-      attribution: "&copy; OpenStreetMap contributors",
+      attribution: "OpenStreetMap",
       maxZoom: 19
     }).addTo(map);
 
-    mapStatus.textContent = "Aguardando localização da criança...";
-
-    const locRef = ref(db, `rooms/${token}/location/current`);
+    const locRef = ref(db, "rooms/" + token + "/location/current");
     unsubscribers.push(
       onValue(locRef, (snap) => {
         const val = snap.val() as LocationCurrent | null;
 
         if (!val) {
-          mapStatus.textContent = "Sem localização ainda (a criança iniciou o compartilhamento?).";
+          mapStatus.textContent = "Aguardando criança iniciar...";
           return;
         }
 
-        mapStatus.textContent = `Atualizado: ${new Date(val.ts).toLocaleTimeString()} (±${Math.round(
-          val.accuracy
-        )}m)`;
+        // SEM TEMPLATE STRING
+        const timeStr = new Date(val.ts).toLocaleTimeString();
+        const accStr = Math.round(val.accuracy).toString();
+        mapStatus.textContent = timeStr + " • ±" + accStr + "m";
 
         const latlng: [number, number] = [val.lat, val.lng];
 
